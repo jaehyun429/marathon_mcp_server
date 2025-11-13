@@ -1,11 +1,13 @@
 # marathon_server.py
+# type: ignore
 from fastmcp import FastMCP
-from playwright.async_api import async_playwright
+import httpx
 from bs4 import BeautifulSoup
 import json
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
+import sys
 
 mcp = FastMCP("marathon-crawler")
 
@@ -16,13 +18,14 @@ _cache = {
     'ttl': 3600  # 1시간 캐시
 }
 
-async def fetch_detail(page, detail_url: str, base_domain: str) -> Optional[dict]:
-    """단일 마라톤 상세 정보 가져오기"""
+async def fetch_detail(client: httpx.AsyncClient, detail_url: str, base_domain: str) -> Optional[dict]:
+    """정적 단일 마라톤 상세 정보 가져오기"""
     try:
         full_url = base_domain + detail_url if not detail_url.startswith('http') else detail_url
-        await page.goto(full_url, wait_until='domcontentloaded', timeout=15000)
-        
-        html = await page.content()
+        response = await client.get(full_url, timeout= 15.0)
+        response.raise_for_status()
+
+        html = response.text
         soup = BeautifulSoup(html, 'html.parser')
         
         script_tag = soup.find('script', {'id': '__NEXT_DATA__'})
@@ -53,7 +56,7 @@ async def fetch_detail(page, detail_url: str, base_domain: str) -> Optional[dict
                     '상세URL': detail_url
                 }
     except Exception as e:
-        print(f"Error fetching {detail_url}: {e}")
+        print(f"Error fetching {detail_url}: {e}", file=sys.stderr)
         return None
 
 def is_accepting_applications(marathon: dict) -> bool:
@@ -147,15 +150,12 @@ async def crawl_marathons_fast(base_url: str, base_domain: str, max_concurrent: 
     """병렬 처리로 빠르게 크롤링"""
     all_marathons = []
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        
+    async with httpx.AsyncClient() as client:
         try:
-            # 1. 목록 페이지에서 URL들만 먼저 수집
-            page = await browser.new_page()
-            await page.goto(base_url, wait_until='domcontentloaded', timeout=30000)
-            html = await page.content()
-            await page.close()
+            # 1. 목록 페이지 HTML 정적 요청
+            response = await client.get(base_url, timeout=30.0)
+            response.raise_for_status()
+            html = response.text
             
             soup = BeautifulSoup(html, 'html.parser')
             marathon_links = soup.find_all('a', class_='MuiLink-root')
@@ -167,6 +167,7 @@ async def crawl_marathons_fast(base_url: str, base_domain: str, max_concurrent: 
                     detail_urls.append(href)
             
             if not detail_urls:
+                print("경고: 상세 페이지 링크를 찾지 못했습니다. (사이트 구조 변경 가능성)", file=sys.stderr)
                 return []
             
             # 2. 병렬로 상세 페이지 크롤링
@@ -174,20 +175,18 @@ async def crawl_marathons_fast(base_url: str, base_domain: str, max_concurrent: 
             
             async def fetch_with_semaphore(url):
                 async with semaphore:
-                    page = await browser.new_page()
-                    try:
-                        result = await fetch_detail(page, url, base_domain)
-                        return result
-                    finally:
-                        await page.close()
+                    result = await fetch_detail(client, url, base_domain)
+                    return result
             
             tasks = [fetch_with_semaphore(url) for url in detail_urls]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             all_marathons = [r for r in results if r and not isinstance(r, Exception)]
             
-        finally:
-            await browser.close()
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP 오류 발생 : {e.response.status_code} - {e.request.url}", file=sys.stderr)
+        except Exception as e:
+            print(f"크롤링 중 알 수 없는 오류 발생 : {e}", file=sys.stderr)
     
     return all_marathons
 
@@ -242,10 +241,15 @@ async def crawl_korean_marathons(
     if use_cache and is_cache_valid():
         results = _cache['data']
     else:
+        print("Fetching new data", file=sys.stderr)
         results = await crawl_marathons_fast(base_url, base_domain, max_concurrent=10)
-        _cache['data'] = results
-        _cache['timestamp'] = datetime.now()
-    
+        if results:
+            _cache['data'] = results
+            _cache['timestamp'] = datetime.now()
+            print(f"데이터 {len(results)}개 로드 및 캐시 저장", file=sys.stderr)
+        else:
+            print("Data fetch failed", file=sys.stderr)
+        
     # 필터링 적용
     filtered_results = results
     
